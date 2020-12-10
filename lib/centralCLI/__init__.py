@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Union
 from sys import argv
 import logging
+from . import constants  # NoQA
 utils = Utils()
 
 
@@ -114,6 +115,7 @@ class MyLogger:
 
     def setLevel(self, level):
         getattr(self._log, 'setLevel')(level)
+        pass
 
 
 _calling_script = Path(argv[0])
