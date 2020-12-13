@@ -20,20 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# import getpass
 from pycentral.base import ArubaCentralBase
 import requests
-# import yaml
-import pprint
-# import os
 import json
-from typing import Union
-import urllib.parse
+from typing import List, Tuple, Union
 import csv
 from . import MyLogger, Response, config, log
-# Get instance of ArubaCentralBase from the central_filename
-# from pycentral.workflows.workflows_utils import get_conn_from_file
-# from pathlib import Path
 
 try:
     from . import utils
@@ -42,13 +34,6 @@ except ImportError:
     utils = Utils()
 
 
-# _refresh_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config", ".refresh_token.yaml"))
-# _refresh_file = Path.joinpath(Path(__file__), "config", ".refresh_token.yaml")
-# _config_file = Path.joinpath(Path(__file__).parent.parent.parent, "config", "config.yaml")
-# _bulk_edit_file = _config_file.parent.joinpath('bulkedit.csv')
-
-# TODO build own function for this so we can set token_store vs overriding it in cli.py
-# central = get_conn_from_file(filename=config.config_file)
 DEFAULT_TOKEN_STORE = {
   "type": "local",
   "path": f"{config.dir.joinpath('.cache')}"
@@ -56,11 +41,12 @@ DEFAULT_TOKEN_STORE = {
 
 
 def get_conn_from_file(account_name, logger: MyLogger = log):
-    """Creates an instance of class`pycentral.ArubaCentralBase` based on the information
-    provided in the YAML/JSON file. \n
-        * keyword central_info: A dict containing arguments as accepted by class`pycentral.ArubaCentralBase` \n
-        * keyword ssl_verify: A boolean when set to True, the python client validates Aruba Central's SSL certs. \n
-        * keyword token_store: Optional. Defaults to None. \n
+    """Creates an instance of class`pycentral.ArubaCentralBase` based on config file
+
+    provided in the YAML/JSON config file:
+        * keyword central_info: A dict containing arguments as accepted by class`pycentral.ArubaCentralBase`
+        * keyword ssl_verify: A boolean when set to True, the python client validates Aruba Central's SSL certs.
+        * keyword token_store: Optional. Defaults to None.
 
     :param filename: Name of a JSON/YAML file containing the keywords required for class:`pycentral.ArubaCentralBase`
     :type filename: str
@@ -83,33 +69,26 @@ def get_conn_from_file(account_name, logger: MyLogger = log):
 
 
 class CentralApi:
-    log = log
-
-    # def __init__(self, central: CentralApiAuth = CentralApiAuth()):
     def __init__(self, account_name):
         self.central = get_conn_from_file(account_name)
-        # self.headers = {"authorization": f"Bearer {self.central.central_info['token']['access_token']}"}
+
+        cfg_dict = self.central.central_info
+        tok_dict = cfg_dict["token"]
+
         # Temp Refactor to use ArubaBaseClass without changing all my methods
-        # self.central.get = self.get
         self.central.get = self.get
 
-    # def get(self, url: str, params: dict = {}, data: dict = {},
-    #         headers: dict = {}, files: dict = {}, retry_api_call: bool = True) -> dict:
-    #     return self.central.command("GET", apiPath=url, apiData=data, apiParams=params,
-    #                                 headers=headers, files=files, retry_api_call=retry_api_call)
+        self.headers = {
+            "authorization": f"{tok_dict.get('token_type', 'Bearer')} {tok_dict['access_token']}",
+            "Content-type": "application/json"
+        }
+
+        # def get(self, url: str, params: dict = {}, data: dict = {},
+        #         headers: dict = {}, files: dict = {}, retry_api_call: bool = True) -> dict:
+        #     return self.central.command("GET", apiPath=url, apiData=data, apiParams=params,
+        #                                 headers=headers, files=files, retry_api_call=retry_api_call)
 
     def get(self, url, params: dict = None, headers: dict = None):
-        """Generic GET call
-
-        :param vars: Imported variables
-        :type vars: Python dict
-        :param url: GET call URL
-        :type url: String
-        :param header: GET call parameters
-        :type header: Python dict
-        :return: GET call response JSON
-        :rtype: Python dict
-        """
         f_url = self.central.central_info["base_url"] + url
         return Response(self.central.requestUrl, f_url, params=params, headers=headers)
 
@@ -141,8 +120,27 @@ class CentralApi:
         url = f"/monitoring/v1/swarms/{swarm_id}"
         return self.central.get(url)
 
-    def get_all_clients(self, group: str = None, swarm_id: str = None, label: str = None, ssid: str = None,
-                        serial: str = None, os_type: str = None, cluster_id: str = None, band: str = None) -> None:
+    def get_clients(self, *args: Tuple[str], group: str = None, swarm_id: str = None,
+                    label: str = None, ssid: str = None,
+                    serial: str = None, os_type: str = None,
+                    cluster_id: str = None, band: str = None, mac: str = None) -> Response:
+        if not args.count(str) > 0 or "all" in args:
+            return self._get_all_clients()
+        elif "wired" in args:
+            return self._get_wired_clients()
+        elif "wireless" in args:
+            return self._get_wireless_clients()
+        elif mac:
+            mac = utils.Mac(args)
+            if mac.ok:
+                return self._get_client_details(mac)
+            else:
+                print(f"Invalid mac {mac}")
+        else:
+            print(f"Invalid arg {args}")
+
+    def _get_all_clients(self, group: str = None, swarm_id: str = None, label: str = None, ssid: str = None,
+                         serial: str = None, os_type: str = None, cluster_id: str = None, band: str = None) -> Response:
         params = {}
         for k, v in zip(["group", "swarm_id", "label", "ssid", "serial", "os_type", "cluster_id", "band"],
                         [group, swarm_id, label, ssid, serial, os_type, cluster_id, band]
@@ -151,16 +149,16 @@ class CentralApi:
                 params[k] = v
 
         # return structure:  {'clients': [], 'count': 0}
-        resp = self.get_wlan_clients(**params)
+        resp = self._get_wireless_clients(**params)
         if resp.ok:
             wlan_resp = resp
-            resp = self.get_wired_clients(**params)
+            resp = self._get_wired_clients(**params)
             if resp.ok:
                 resp.output = wlan_resp.output.get("clients") + resp.output.get("clients")
         return resp
 
-    def get_wlan_clients(self, group: str = None, swarm_id: str = None, label: str = None, ssid: str = None,
-                         serial: str = None, os_type: str = None, cluster_id: str = None, band: str = None) -> None:
+    def _get_wireless_clients(self, group: str = None, swarm_id: str = None, label: str = None, ssid: str = None,
+                              serial: str = None, os_type: str = None, cluster_id: str = None, band: str = None) -> Response:
         params = {}
         for k, v in zip(["group", "swarm_id", "label", "ssid", "serial", "os_type", "cluster_id", "band"],
                         [group, swarm_id, label, ssid, serial, os_type, cluster_id, band]
@@ -171,8 +169,8 @@ class CentralApi:
         url = "/monitoring/v1/clients/wireless"
         return self.central.get(url, params=params)
 
-    def get_wired_clients(self, group: str = None, swarm_id: str = None, label: str = None, ssid: str = None,
-                          serial: str = None, cluster_id: str = None, stack_id: str = None) -> None:
+    def _get_wired_clients(self, group: str = None, swarm_id: str = None, label: str = None, ssid: str = None,
+                           serial: str = None, cluster_id: str = None, stack_id: str = None) -> Response:
         params = {}
         for k, v in zip(["group", "swarm_id", "label", "ssid", "serial", "cluster_id", "stack_id"],
                         [group, swarm_id, label, ssid, serial, cluster_id, stack_id]
@@ -183,9 +181,13 @@ class CentralApi:
         url = "/monitoring/v1/clients/wired"
         return self.central.get(url, params=params)
 
-    def get_client_details(self, mac: str):
-        url = f"/monitoring/v1/clients/wired/{urllib.parse.quote(mac)}"
-        return self.central.get(url)
+    def _get_client_details(self, mac: utils.Mac) -> Response:
+        url = f"/monitoring/v1/clients/wired/{mac.url}"
+        resp = self.central.get(url)
+        return resp
+        # TODO need to check wireless if doesn't exist there check wired or see if there is generic wired/wlan method
+        # if resp.ok
+        #     if not resp.output:
 
     def get_certificates(self):
         url = "/configuration/v1/certificates"
@@ -197,9 +199,12 @@ class CentralApi:
         return self.central.get(url)
 
     def get_all_groups(self):  # DONE
-        url = "/configuration/v2/groups?limit=20&offset=0"
-        params = {"limit": 20, "offset": 0}
-        return self.central.get(url, params=params)
+        url = "/configuration/v2/groups"
+        params = {"limit": 20, "offset": 0}  # 20 is the max
+        resp = self.central.get(url, params=params)
+        if resp.ok and resp.get("data"):
+            resp["data"] = [g for _ in resp["data"] for g in _ if g != "unprovisioned"]
+        return resp
 
     def get_sku_types(self):
         url = "/platform/orders/v1/skus"
@@ -227,7 +232,7 @@ class CentralApi:
             # TODO generator for returns > 20 devices
         return self.central.get(url, params=params)
 
-    # TODO self.central.patch
+    # TODO self.patch
     def update_variables(self, serialnum: str, var_dict: dict):
         url = f"/configuration/v1/devices/{serialnum}/template_variables"
         header = {
@@ -281,7 +286,15 @@ class CentralApi:
         return self.central.get(url)
 
     def get_all_sites(self):
-        return self.central.get("/central/v2/sites")
+        resp = self.central.get("/central/v2/sites")
+
+        # strip visualrrf_default site from response
+        if resp.ok:
+            _ = resp.output.get("sites", "")
+            resp["sites"] = [s for s in _ if s.get("site_name", "") != "visualrf_default"]
+            # TODO move site_name to front of dict
+
+        return resp
 
     def get_site_details(self, site_id):
         return self.central.get(f"/central/v2/sites/{site_id}")
@@ -291,16 +304,15 @@ class CentralApi:
         params = {"group": group}
         return self.central.get(url, params=params)
 
-    def bounce_poe(self, serial_num: str, port: Union[str, int]) -> Response:
+    def bounce_poe(self, port: Union[str, int], serial_num: str = None, name: str = None, ip: str = None) -> Response:
+        # TODO allow bounce by name or ip
         url = f"/device_management/v1/device/{serial_num}/action/bounce_poe_port/port/{port}"
-        return self.central.post(url)
+        print(url)
+        return self.post(url)
 
-    def kick_users(self, serial_num, kick_all=False, mac=None, ssid=None):
+    def kick_users(self, serial_num: str = None, name: str = None, kick_all: bool = False,
+                   mac: str = None, ssid: str = None, hint: Union[List[str], str] = None) -> Union[Response, None]:
         url = f"/device_management/v1/device/{serial_num}/action/disconnect_user"
-        header = {
-            "authorization": f"Bearer {self.access_token}",
-            "Content-type": "application/json"
-        }
         if kick_all:
             payload = {"disconnect_user_all": True}
         elif mac:
@@ -311,10 +323,12 @@ class CentralApi:
             payload = {}
 
         if payload:
-            resp = requests.post(self.central.vars["base_url"] + url, headers=header, json=payload)
-            pprint.pprint(resp.json())
+            return Response(self.post, url, payload=payload)
+            # pprint.pprint(resp.json())
         else:
-            print("Missing Required Parameters")
+            # TODO adapt Response object so we can send error through it
+            # without a function... resp.ok = False, resp.error = The Error
+            log.error("Missing Required Parameters", show=True)
 
     def get_task_status(self, task_id):
         return self.central.get(f"/device_management/v1/status/{task_id}")
@@ -337,13 +351,10 @@ class CentralApi:
                     "serial": serial_num
                 }
             ]
-        header = {
-            "authorization": f"Bearer {self.central.access_token}",
-            "Content-type": "application/json"
-        }
 
-        resp = requests.post(self.central.vars["base_url"] + url, headers=header, json=payload)
-        pprint.pprint(resp.json())
+        return Response(self.post, url, payload=payload)
+        # resp = requests.post(self.central.vars["base_url"] + url, headers=header, json=payload)
+        # pprint.pprint(resp.json())
 
     def verify_add_dev(self, mac: str, serial_num: str):
         """
@@ -366,33 +377,25 @@ class CentralApi:
                     "serial": serial_num
                 }
             ]
-        header = {
-            "authorization": f"Bearer {self.central.access_token}",
-            "Content-type": "application/json"
-        }
 
-        resp = requests.post(self.central.vars["base_url"] + url, headers=header, json=payload)
-        pprint.pprint(resp.json())
+        return Response(self.post, url, payload=payload)
+        # resp = requests.post(self.central.vars["base_url"] + url, headers=header, json=payload)
+        # pprint.pprint(resp.json())
 
-    def move_dev_to_group(self, group: str, serial_num: Union[str, list]):
+    def move_dev_to_group(self, group: str, serial_num: Union[str, list]) -> bool:
         url = "/configuration/v1/devices/move"
         if not isinstance(serial_num, list):
             serial_num = [serial_num]
+
         payload = {
                     "group": group,
                     "serials": serial_num
                   }
-        header = {
-            "authorization": f"Bearer {self.central.access_token}",
-            "Content-type": "application/json"
-        }
 
-        resp = requests.post(self.central.vars["base_url"] + url, headers=header, json=payload)
-        return resp.ok
+        # resp = requests.post(self.central.vars["base_url"] + url, headers=headers, json=payload)
+        return Response(self.post, url, payload=payload)
 
     def caasapi(self, group_dev: str, cli_cmds: list = None):
-        cfg_dict = self.central.central_info
-        tok_dict = cfg_dict["token"]
         if ":" in group_dev and len(group_dev) == 17:
             key = "node_name"
         else:
@@ -400,20 +403,17 @@ class CentralApi:
 
         url = "/caasapi/v1/exec/cmd"
 
+        cfg_dict = self.central.central_info
         params = {
             "cid": cfg_dict["customer_id"],
             key: group_dev
         }
 
-        headers = {
-            "authorization": f"{tok_dict.get('token_type', 'Bearer')} {tok_dict['access_token']}",
-            "Content-type": "application/json"
-        }
-
         payload = {"cli_cmds": cli_cmds or []}
 
-        f_url = self.central.central_info["base_url"] + url
-        return Response(requests.post, f_url, params=params, json=payload, headers=headers)
+        # f_url = self.central.central_info["base_url"] + url
+        # return Response(requests.post, f_url, params=params, json=payload, headers=headers)
+        return Response(self.post, url, params=params, payload=payload)
 
         # return requests.post(self.central.vars["base_url"] + url, params=params, headers=header, json=payload)
         # TODO use my resp generator

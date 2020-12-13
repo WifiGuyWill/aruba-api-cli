@@ -12,29 +12,6 @@ from . import constants  # NoQA
 utils = Utils()
 
 
-class Response:
-    '''wrapper for requests.response object
-
-    Assigns commonly evaluated attributes regardless of success
-    Otherwise resp.ok will always be assigned and will be True or False
-    '''
-    def __init__(self, function, *args: Any, **kwargs: Any) -> Any:
-        try:
-            resp = function(*args, **kwargs)
-            self.ok = resp.ok
-            try:
-                self.output = resp.json()
-            except Exception:
-                self.output = resp.text
-            self.error = resp.reason
-            self.status_code = resp.status_code
-        except Exception as e:
-            self.ok = False
-            self.output = {}
-            self.error = f"Exception occurred {e.__class__}\n\t{e}"
-            self.status_code = 418
-
-
 class MyLogger:
     def __init__(self, log_file: Union[str, Path], debug: bool = False, show: bool = False):
         self.log_msgs = []
@@ -118,7 +95,80 @@ class MyLogger:
         pass
 
 
+class Response:
+    '''wrapper for requests.response object
+
+    Assigns commonly evaluated attributes regardless of success
+    Otherwise resp.ok will always be assigned and will be True or False
+    '''
+    def __init__(self, function, *args: Any, **kwargs: Any) -> Any:
+        log.debug(f"request url: {'' if not args else args[0]}")
+        try:
+            resp = function(*args, **kwargs)
+            self.ok = resp.ok
+            try:
+                self.output = resp.json()
+            except Exception:
+                self.output = resp.text
+            self.error = resp.reason
+            self.status_code = resp.status_code
+        except Exception as e:
+            self.output = {}
+            self.ok = False
+            self.error = f"Exception occurred {e.__class__}\n\t{e}"
+            self.status_code = 418
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        f"<{self.__module__}.{type(self).__name__} ({'OK' if self.ok else 'ERROR'}) object at {hex(id(self))}>"
+
+    def __str__(self):
+        return str(self.output) if self.output else self.error
+
+    def __setitem__(self, name: str, value: Any) -> None:
+        if isinstance(name, (str, int)) and hasattr(self, "output") and name in self.output:
+            self.output[name] = value
+
+    def __getitem__(self, key):
+        return self.output[key]
+
+    def __getattr__(self, name: str) -> Any:
+        print(f"hit {name}")
+        if hasattr(self, "output") and self.output:
+            if name in self.output:
+                return self.output[name]
+            else:
+                # return from 2nd level of dict
+                _keys = [k for k in constants.STRIP_KEYS if k in self.output]
+                if _keys and name in self.output[_keys[0]] and isinstance(self.output[_keys[0]], dict):
+                    return self.output[_keys[0]]
+
+    def __iter__(self):
+        for k, v in self.output.items():
+            yield k, v
+
+    def get(self, key):
+        return self.output.get(key)
+
+    def keys(self):
+        return self.output.keys()
+
+    # not implemented yet
+    def clean_response(self):
+        _keys = [k for k in constants.STRIP_KEYS if k in self.output]
+        if len(_keys) == 1:
+            return self.output[_keys[0]]
+        else:
+            print(f"More wrapping keys than expected from return {_keys}")
+
+
 _calling_script = Path(argv[0])
+# print(f"\t\t\t--- {_calling_script} ---")
+_calling_script = Path.cwd() / "cli.py" if str(_calling_script) == "." else _calling_script  # vscode run in python shell
+# print(f"\t\t\t--- {str(_calling_script) == '.'} ---")
+# print(f"\t\t\t--- {_calling_script} ---")
 log_file = _calling_script.joinpath(_calling_script.resolve().parent, "logs", f"{_calling_script.stem}.log")
 
 config = Config(base_dir=_calling_script.resolve().parent)
