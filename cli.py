@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from enum import Enum
+
 from os import environ
 from pathlib import Path
 from typing import List
@@ -7,10 +7,10 @@ from typing import List
 import sys
 import typer
 
-from lib.centralCLI import config, log, utils
-from lib.centralCLI.central import BuildCLI, CentralApi
-from lib.centralCLI.constants import (ShowArgs, SortOptions, StatusOptions,
-                                      arg_to_what, devices)
+from centralCLI import config, log, utils
+from centralCLI.central import BuildCLI, CentralApi
+from centralCLI.constants import (DoArgs, ShowArgs, SortOptions, StatusOptions, TemplateLevel1,
+                                  arg_to_what, devices)
 
 STRIP_KEYS = ["data", "devices", "mcs", "group", "clients", "sites", "switches", "aps"]
 SPIN_TXT_AUTH = "Establishing Session with Aruba Central API Gateway..."
@@ -106,12 +106,6 @@ def vscode_arg_handler():
         return
 
 
-class TemplateLevel1(str, Enum):
-    update = "update"
-    delete = "delete"
-    add = "add"
-
-
 def eval_resp(resp):
     if not resp.ok:
         typer.echo(f"{typer.style('ERROR:', fg=typer.colors.RED)} "
@@ -183,53 +177,78 @@ def bulk_edit(input_file: str = typer.Argument(None)):
 #          ):
 
 
-show_dev_opts = ["switch[es]", "ap[s]", "gateway[s]", "controller[s]"]
+show_help = ["all (devices)", "switch[es]", "ap[s]", "gateway[s]", "group[s]", "site[s]",
+             "clients", "template[s]", "variables", "certs"]
 
 
 @app.command(short_help="Show Details about Aruba Central Objects")
-def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_dev_opts)}]"),
+def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_help)}]"),
          #  args: List[str] = typer.Argument(None, hidden=True),
          args: str = typer.Argument(None, hidden=True),
          group: str = typer.Option(None, metavar="<Device Group>", help="Filter by Group", ),
          label: str = typer.Option(None, metavar="<Device Label>", help="Filter by Label", ),
          dev_id: int = typer.Option(None, "--id", metavar="<id>", help="Filter by id"),
-         status: StatusOptions = typer.Option(None, help="Filter by device status"),
+         status: StatusOptions = typer.Option(None, metavar="[up|down]", help="Filter by device status"),
          pub_ip: str = typer.Option(None, metavar="<Public IP Address>", help="Filter by Public IP"),
          do_json: bool = typer.Option(False, "--json", is_flag=True, help="Output in JSON"),
          do_yaml: bool = typer.Option(False, "--yaml", is_flag=True, help="Output in YAML"),
          do_csv: bool = typer.Option(False, "--csv", is_flag=True, help="Output in CSV"),
          do_stats: bool = typer.Option(False, "--stats", is_flag=True, help="Show device statistics"),
-         do_clients: bool = typer.Option(False, "--clients", is_flag=True, help="Calculate client ..."),
+         do_clients: bool = typer.Option(False, "--clients", is_flag=True, help="Calculate client count (per device)"),
          outfile: Path = typer.Option(None, writable=True),
-         sort_by: SortOptions = typer.Option(None, "--sort")):
+         sort_by: SortOptions = typer.Option(None, "--sort"),
+         no_pager: bool = typer.Option(False, "--no-pager", help="Disable Paged Output"),
+         ):
 
     what = arg_to_what.get(what)
 
     # -- // Peform GET Call \\ --
     resp = None
     if what in devices:
-        if not group:
-            resp = utils.spinner(SPIN_TXT_DATA, session.get_dev_by_type, what)
+        params = {
+            "group": group,
+            "status": None if not status else status.title(),
+            "label": label,
+            "public_ip_address": pub_ip,
+            "calculate_client_count": do_clients,
+            "show_resource_details": do_stats,
+            "sort": None if not sort_by else sort_by._value_
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+        if what == "all":
+            # resp = utils.spinner(SPIN_TXT_DATA, session.get_all_devices)
+            resp = utils.spinner(SPIN_TXT_DATA, session.get_all_devicesv2, **params)
         else:
-            # resp = utils.spinner(SPIN_TXT_DATA, session.get_gateways_by_group, group)
-            resp = utils.spinner(SPIN_TXT_DATA, session.get_devices, what, group=group)
+            resp = utils.spinner(SPIN_TXT_DATA, session.get_devices, what, **params)
+        # elif not group:
+        #     resp = utils.spinner(SPIN_TXT_DATA, session.get_dev_by_type, what)
+        # else:
+        #     # resp = utils.spinner(SPIN_TXT_DATA, session.get_gateways_by_group, group)
+        #     # TODO this is a very different dataset... will determine most ideal to return
+        #     resp = utils.spinner(SPIN_TXT_DATA, session.get_devices(), what, group=group, **params)
 
-    elif what == "groups":
-        resp = session.get_all_groups()
+    elif what == "groups":  # VERIFIED
+        resp = session.get_all_groups()  # simple list of str
 
-    elif what == "sites":
+    elif what == "sites":  # VERIFIED
         if dev_id is None:
-            resp = session.get_all_sites()
+            resp = session.get_all_sites()  # VERIFIED
         else:
-            resp = session.get_site_details(id)
+            resp = session.get_site_details(dev_id)  # VERIFIED
 
     elif what == "template":
-        if group:
+        if not args:
+            typer.echo(
+                typer.style("template keyword requires additional argument: <template name | serial>", fg="red")
+            )
+            raise typer.Exit(1)
+        elif group:
             # args is template name in this case
             resp = utils.spinner(SPIN_TXT_DATA, session.get_template, group, args)
         else:
+            # TODO lookup by name, ip address, etc
             # args is device serial num in this case
-            resp = session.get_variablised_template(args)
+            resp = session.get_variablised_template(args)  # VERIFIED
 
     # if what provided (serial_num) gets vars for that dev otherwise gets vars for all devs
     elif what == "variables":
@@ -244,15 +263,16 @@ def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_dev_opt
     data = None if not resp else eval_resp(resp)
 
     if data:
-        # Strip needless inconsistent json key from dict if present
+        # TODO enable cleaner in Response... will benefit all command paths
         if isinstance(data, dict):
             for wtf in STRIP_KEYS:
                 if wtf in data:
                     data = data[wtf]
                     break
 
-        if isinstance(data, str):
-            typer.echo_via_pager(data) if len(data) > tty.rows else typer.echo(data)
+        # if isinstance(data, str):
+        #     data = data.splitlines()
+            # typer.echo_via_pager(data) if len(data) > tty.rows else typer.echo(data)
 
         if do_json is True:
             tablefmt = "json"
@@ -265,7 +285,7 @@ def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_dev_opt
         else:
             tablefmt = "simple"
         outdata = utils.output(data, tablefmt)
-        typer.echo_via_pager(outdata) if len(outdata) > tty.rows else typer.echo(outdata)
+        typer.echo_via_pager(outdata) if not no_pager and len(outdata) > tty.rows else typer.echo(outdata)
 
         # -- // Output to file \\ --
         if outfile and outdata:
@@ -301,6 +321,45 @@ def template(operation: TemplateLevel1 = typer.Argument(...),
                     typer.echo(f"{typer.style('Success', fg=typer.colors.GREEN)}")
                 else:
                     typer.echo(f"{typer.style('Error Returned', fg=typer.colors.RED)}")
+
+
+@app.command()
+def do(what: DoArgs = typer.Argument(...),
+       # args: str = typer.Argument(..., metavar="Identifying Attributes: [serial #|name|ip address|mac address]"),
+       args: str = typer.Argument(None, metavar="identifying attribute i.e. port #, required for some actions."),
+       serial: str = typer.Option(None),
+       name: str = typer.Option(None),
+       ip: str = typer.Option(None),
+       mac: str = typer.Option(None),
+       yes: bool = typer.Option(False, "-Y", metavar="Bypass confirmation prompts - Assume Yes"),
+       ) -> None:
+
+    # serial_num is currently only real option until cache/lookup is implemented
+    kwargs = {
+        "serial_num": serial,
+        "name": name,
+        "ip": ip,
+        "mac": None if not mac else utils.Mac(mac)
+    }
+    typer.echo("\n".join([f"{k}: {v}" for k, v in locals().items()]))
+
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    if typer.confirm(typer.style(f"Please Confirm {what} {args}", fg="cyan")):
+        resp = getattr(session, what.replace("-", "_"))(args, **kwargs)
+        typer.echo(resp)
+        if resp.ok:
+            typer.echo(f"{typer.style('Success', fg='green')} command Queued.")
+            resp = session.get_task_status(resp.task_id)
+            typer.secho(f"Task Status: {resp.get('reason', '')}, State: {resp.state}", fg="green" if resp.ok else "red")
+
+    else:
+        raise typer.Abort()
+    # if what == "bounce-poe":
+    #     resp = session.bounce_poe(args2, )
+    # elif what == "bounce-interface":
+    #     typer.echo(f"{what}, {args}, {yes}")
+    # elif what == "reboot":
+    #     pass
 
 
 @app.command()
@@ -434,6 +493,9 @@ def _refresh_tokens(account_name: str) -> CentralApi:
 
 
 # ---- // RUN \\ ----
+
+# TODO We may be able to do this in @app.callback which is run before the command
+# https://typer.tiangolo.com/tutorial/commands/context/
 if environ.get("TERM_PROGRAM") == "vscode":
     vscode_arg_handler()
 
