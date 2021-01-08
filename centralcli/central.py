@@ -22,7 +22,7 @@
 
 # from pycentral.base import ArubaCentralBase
 # import sys
-from centralcli import constants
+# from centralcli import constants
 # import pycentral.base
 import json
 from typing import List, Tuple, Union
@@ -78,7 +78,8 @@ def get_conn_from_file(account_name, logger: MyLogger = log):
         "logger": logger
     }
 
-    conn = utils.spinner(constants.MESSAGES["SPIN_TXT_AUTH"], ArubaCentralBase, name="init_ArubaCentralBase", **kwargs)
+    # conn = utils.spinner(constants.MESSAGES["SPIN_TXT_AUTH"], ArubaCentralBase, name="init_ArubaCentralBase", **kwargs)
+    conn = ArubaCentralBase(**kwargs)
     token_cache = Path(tokenLocalStoreUtil(token_store,
                                            central_info["customer_id"],
                                            central_info["client_id"]))
@@ -102,7 +103,7 @@ def get_conn_from_file(account_name, logger: MyLogger = log):
 
 
 class CentralApi:
-    def __init__(self, account_name: str):
+    def __init__(self, account_name: str = "central_info"):
         self.central = get_conn_from_file(account_name)
 
         self.headers = {
@@ -113,28 +114,28 @@ class CentralApi:
     def get(self, url, params: dict = {}, headers: dict = None, **kwargs) -> Response:
         f_url = self.central.central_info["base_url"] + url
         headers = self.headers if headers is None else {**self.headers, **headers}
-        params = {k: v for k, v in params.items() if v is not None}
-        return Response(self.central.requestUrl, f_url, params=params, headers=headers, central=self.central, **kwargs)
+        params = self.strip_none(params)
+        return Response(self.central, f_url, params=params, headers=headers, **kwargs)
 
     def post(self, url, params: dict = {}, payload: dict = None, headers: dict = None, **kwargs) -> Response:
         f_url = self.central.central_info["base_url"] + url
-        params = {k: v for k, v in params.items() if v is not None}
+        params = self.strip_none(params)
         headers = self.headers if headers is None else {**self.headers, **headers}
-        return Response(self.central.requestUrl, f_url, method="POST", data=payload, params=params, headers=headers, **kwargs)
+        return Response(self.central, f_url, method="POST", data=payload, params=params, headers=headers, **kwargs)
 
     def patch(self, url, params: dict = {}, payload: dict = None, headers: dict = None, **kwargs) -> Response:
         f_url = self.central.central_info["base_url"] + url
-        params = {k: v for k, v in params.items() if v is not None}
+        params = self.strip_none(params)
         headers = self.headers if headers is None else {**self.headers, **headers}
-        return Response(self.central.requestUrl, f_url, method="PATCH", data=payload, params=params, headers=headers, **kwargs)
+        return Response(self.central, f_url, method="PATCH", data=payload, params=params, headers=headers, **kwargs)
 
     def delete(self, url, params: dict = {}, payload: dict = None, headers: dict = None, **kwargs) -> Response:
         f_url = self.central.central_info["base_url"] + url
         headers = self.headers if headers is None else {**self.headers, **headers}
-        params = {k: v for k, v in params.items() if v is not None}
-        return Response(self.central.requestUrl, f_url, method="DELETE", data=payload, params=params, headers=headers, **kwargs)
+        params = self.strip_none(params)
+        return Response(self.central, f_url, method="DELETE", data=payload, params=params, headers=headers, **kwargs)
 
-    # Not used changed default kwarg for params to {} vs None not sure which is more "Pythonic"
+    @staticmethod
     def strip_none(_dict: Union[dict, None]) -> Union[dict, None]:
         """strip all keys from a dict where value is NoneType"""
 
@@ -186,13 +187,13 @@ class CentralApi:
             if v:
                 params[k] = v
 
-        # return structure:  {'clients': [], 'count': 0}
         resp = self._get_wireless_clients(**params)
         if resp.ok:
             wlan_resp = resp
             resp = self._get_wired_clients(**params)
             if resp.ok:
                 resp.output = wlan_resp.output + resp.output
+                resp.output = cleaner.get_all_clients(resp.output)
         return resp
 
     def _get_wireless_clients(self, group: str = None, swarm_id: str = None, label: str = None, ssid: str = None,
@@ -365,7 +366,6 @@ class CentralApi:
         else:
             url = "/configuration/v1/devices/template_variables"
             params = {"limit": 20, "offset": 0}
-            # TODO generator for returns > 20 devices
         return self.get(url, params=params)
 
     # TODO self.patch  --> Refactor to pycentral
@@ -380,12 +380,11 @@ class CentralApi:
     def get_devices(self, dev_type: str, group: str = None, label: str = None, stack_id: str = None,
                     status: str = None, fields: list = None, show_resource_details: bool = False,
                     calculate_client_count: bool = False, calculate_ssid_count: bool = False,
-                    public_ip_address: str = None, limit: int = None, offset: int = None, sort: str = None):
+                    public_ip_address: str = None, limit: int = 100, offset: int = 0, sort: str = None):
         # pagenation limit default 100, max 1000
-        # does not return _next... pager will need to page until count < limit
+
         _strip = ["self", "dev_type", "url", "_strip"]
-        # if fields is not None:
-        #     fields = json.dumps(fields)
+
         params = {k: v for k, v in locals().items() if k not in _strip and v}
         if dev_type == "switch":
             dev_type = "switches"
@@ -395,18 +394,16 @@ class CentralApi:
         if dev_type in ["aps", "gateways"]:  # TODO remove in favor of our own sort
             if params.get("sort", "").endswith("name"):
                 del params["sort"]
-                log.warning(f"name is not a valid sort option for {dev_type}, Output will have default Sort")
+                log.warning(f"name is not a valid sort option for {dev_type}, Output will have default Sort", show=True)
         url = f"/monitoring/v1/{dev_type}"  # (inside brackets = same response) switches, aps, [mobility_controllers, gateways]
-        return self.get(url, params=params)
+        return self.get(url, params=params, callback=cleaner.get_devices)
 
     def get_dev_details(self, dev_type: str, serial: str) -> Response:
-        # https://internal-apigw.central.arubanetworks.com/monitoring/v1/switches/CN71HKZ1CL
-        if dev_type == "switch":
-            dev_type = "switches"
-        elif dev_type == "gateway":
-            dev_type = "gateways"
+        dev_type = "switches" if dev_type == "switch" else dev_type
+        dev_type = "gateways" if dev_type == "gateway" else dev_type
+        dev_type = "aps" if dev_type == "ap" else dev_type
         url = f"/monitoring/v1/{dev_type}/{serial}"
-        return self.get(url)
+        return self.get(url, callback=cleaner.get_devices)
 
     def get_ssids_by_group(self, group):
         url = "/monitoring/v1/networks"
@@ -444,25 +441,10 @@ class CentralApi:
         return self.get(url, params)
 
     def get_all_sites(self) -> Response:
-        resp = self.get("/central/v2/sites")
-
-        # strip visualrrf_default site from response
-        if resp.ok:  # resp.output = List[dict, ...]
-
-            # sorting logically and stripping tag column for now
-            _sorted = ["site_name", "site_id", "address", "city", "state", "zipcode", "country", "longitude",
-                       "latitude", "associated_device_count"]  # , "tags"]
-            key_map = {
-                "associated_device_count": "associated_devices",
-                "site_id": "id"
-            }
-            resp.output = [{key_map.get(k, k): s[k] for k in _sorted} for s in resp.output
-                           if s.get("site_name", "") != "visualrf_default"]
-
-        return resp
+        return self.get("/central/v2/sites", callback=cleaner.sites)
 
     def get_site_details(self, site_id):
-        return self.get(f"/central/v2/sites/{site_id}")
+        return self.get(f"/central/v2/sites/{site_id}", callback=cleaner.sites)
 
     def get_events_by_group(self, group: str) -> Response:  # VERIFIED
         url = "/monitoring/v1/events"
@@ -502,9 +484,8 @@ class CentralApi:
             return Response(self.post, url, payload=payload)
             # pprint.pprint(resp.json())
         else:
-            # TODO adapt Response object so we can send error through it
-            # without a function... resp.ok = False, resp.error = The Error
-            log.error("Missing Required Parameters", show=True)
+            # TODO move this validation to the cli command
+            return Response(ok=False, error="Missing Required Parameters")
 
     def get_task_status(self, task_id):
         return self.get(f"/device_management/v1/status/{task_id}")

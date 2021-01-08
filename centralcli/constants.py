@@ -11,7 +11,7 @@ dev_to_url = {
 
 class ShowArgs(str, Enum):
     all = "all"
-    # device = "device"
+    device = "device"
     devices = "devices"
     ap = "ap"
     aps = "aps"
@@ -28,6 +28,13 @@ class ShowArgs(str, Enum):
     templates = "templates"
     variables = "variables"
     certs = "certs"
+    cache = "cache"
+
+
+class RefreshWhat(str, Enum):
+    cache = "cache"
+    token = "token"
+    tokens = "tokens"
 
 
 class DoArgs(str, Enum):
@@ -48,7 +55,7 @@ class TemplateLevel1(str, Enum):
 
 
 # Used to determine if arg is for a device (vs group, templates, ...)
-devices = ["switch", "aps", "gateway", "all"]
+devices = ["switch", "aps", "gateway", "all", "device"]
 
 # wrapping keys from return for some calls that have no value
 STRIP_KEYS = ["data", "gateways", "switches", "aps", "devices", "mcs", "group", "clients", "sites"]
@@ -69,7 +76,8 @@ class ArgToWhat:
         self.groups = self.group = "groups"
         self.site = self.sites = "sites"
         self.template = self.templates = "template"
-        self.all = self.devices = "all"
+        self.all = "all"
+        self.device = self.devices = "device"
 
     def get(self, key: Union[ShowArgs, str], default: str = None) -> str:
         if isinstance(key, Enum):
