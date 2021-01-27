@@ -65,9 +65,13 @@ class Response:
         return self.ok
 
     def __repr__(self):
-        f"<{self.__module__}.{type(self).__name__} ({'OK' if self.ok else 'ERROR'}) object at {hex(id(self))}>"
+        # f"<{self.__module__}.{type(self).__name__} ({'OK' if self.ok else 'ERROR'}) object at {hex(id(self))}>"
+        return f"<{self.__module__}.{type(self).__name__} ({self.error}) object at {hex(id(self))}>"
 
     def __str__(self):
+        if isinstance(self.output, dict):
+            return "\n".join([f"  {k}: {v}" for k, v in self.output.items()])
+
         return str(self.output) if self.output else self.error
 
     def __setitem__(self, name: str, value: Any) -> None:
@@ -306,8 +310,8 @@ class Session:
             internal = "internal" in central.central_info["base_url"]
             # if internal:
             token_only = [
-                central.central_info.get("username") is None,
-                central.central_info.get("username", "").endswith("@hpe.com") and internal,
+                central.central_info.get("username") is None
+                or central.central_info["username"].endswith("@hpe.com") and internal,
                 central.central_info.get("password") is None
             ]
             # if not central.central_info["username"] or not central.central_info["password"]:
@@ -316,9 +320,8 @@ class Session:
                         f"\n    customer_id: {central.central_info['customer_id']}" \
                         f"\n    client_id: {central.central_info['client_id']}" \
                         "\n\nPaste result of `Download Tokens` from Central UI."\
-                        f"\nUse {typer.style('CTRL-D', fg='magenta')} on empty line after contents to submit" \
-                        f"\nEnter {typer.style('exit', fg='magenta')} --> {typer.style('Enter', fg='magenta')} " \
-                        f"--> {typer.style('CTRL-D', fg='magenta')} to abort." \
+                        f"\nUse {typer.style('CTRL-D', fg='magenta')} on empty line after contents to submit." \
+                        f"\n{typer.style('exit', fg='magenta')} to abort." \
                         f"\n{typer.style('Waiting for Input...', fg='cyan', blink=True)}\n"
 
                 # typer.launch doesn't work on wsl attempts powershell

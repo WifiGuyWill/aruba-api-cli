@@ -2,7 +2,7 @@
 
 import asyncio
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Union
 from tinydb import TinyDB
 import sys
 import typer
@@ -41,7 +41,15 @@ def account_name_callback(ctx: typer.Context, account: str):
     if ctx.resilient_parsing:  # tab completion, return without validating
         return account
 
-    if account not in config.data:
+    if account in config.data:
+        config.account = account
+        global session
+        session = CentralApi(account)
+        global cache
+        cache = Cache(session)
+        cache.update_meta_db()
+        return account
+    else:
         strip_keys = ['central_info', 'ssl_verify', 'token_store']
         typer.echo(f"{typer.style('ERROR:', fg=typer.colors.RED)} "
                    f"The specified account: '{account}' is not defined in the config @\n"
@@ -66,10 +74,6 @@ def account_name_callback(ctx: typer.Context, account: str):
 
         raise typer.Exit(code=1)
 
-    global session
-    session = CentralApi(account)
-    return account
-
 
 def debug_callback(debug: bool):
     if debug:
@@ -87,13 +91,37 @@ def bulk_edit(input_file: str = typer.Argument(None)):
             caas.eval_caas_response(resp)
 
 
-def eval_resp(resp) -> Any:
+def eval_resp(resp: Response, pad: int = 0) -> Any:
     if not resp.ok:
-        typer.echo(f"{typer.style('ERROR:', fg=typer.colors.RED)} "
-                   f"{resp.output.get('error_description', resp.error).replace('Error: ', '')}"
-                   )
+        msg = f"{' ' * pad}{typer.style('ERROR:', fg=typer.colors.RED)} "
+        if isinstance(resp.output, dict):
+            msg += f"{resp.output.get('description', resp.error).replace('Error: ', '')}"
+        else:
+            msg += str(resp.output)
+
+        typer.echo(msg)
     else:
         return resp.output
+
+
+# TODO combine eval_resp and display_results
+def display_results(data: Union[List[dict], List[str]], tablefmt: str = "simple",
+                    pager=True, outfile: Path = None) -> Union[list, dict]:
+    outdata = utils.output(data, tablefmt)
+    typer.echo_via_pager(outdata) if pager and len(outdata) > tty.rows else typer.echo(outdata)
+
+    # -- // Output to file \\ --
+    if outfile and outdata:
+        if outfile.parent.resolve() == config.base_dir.resolve():
+            config.outdir.mkdir(exist_ok=True)
+            outfile = config.outdir / outfile
+
+        print(
+            typer.style(f"\nWriting output to {outfile}... ", fg="cyan"),
+            end=""
+        )
+        outfile.write_text(outdata.file)  # typer.unstyle(outdata) also works
+        typer.secho("Done", fg="green")
 
 
 show_help = ["all (devices)", "device[s] (same as 'all' unless followed by device identifier)", "switch[es]", "ap[s]",
@@ -141,7 +169,8 @@ def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_help)}]
     what = arg_to_what.get(what)
 
     # load cache to support friendly identifiers
-    cache = Cache(session, refresh=update_cache)
+    # cache = Cache(session, refresh=update_cache)
+    cache(refresh=update_cache)
 
     if group:
         group = cache.get_group_identifier(group)
@@ -260,7 +289,7 @@ def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_help)}]
                     typer.echo(msg)
                     resp = session.request(session.get_variablised_template, _args)
         else:  # provided args but no group
-            _args = cache.get_dev_identifier(args)
+            _args = cache.get_dev_identifier(args, retry=False)
             if _args:  # assume arg is device identifier 1st
                 resp = session.request(session.get_variablised_template, _args)
             else:  # next try template names
@@ -269,6 +298,7 @@ def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_help)}]
                     group, tmplt_name = _args[0], _args[1]
                     resp = session.request(session.get_template, group, tmplt_name)
                 else:
+                    # typer.secho(f"No Match Found for {args} in Cachce")
                     raise typer.Exit(1)
 
     elif what == "variables":
@@ -295,6 +325,7 @@ def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_help)}]
     if resp is None:
         print("Developer Message: resp returned NoneType")
 
+    # TODO make this it's own function
     data = eval_resp(resp)
 
     if data:
@@ -319,14 +350,14 @@ def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_help)}]
                 outfile = config.outdir / outfile
 
             print(
-                typer.style(f"\nWriting output to {outfile.resolve().relative_to(Path.cwd())}... ", fg="cyan"),
+                typer.style(f"\nWriting output to {outfile}... ", fg="cyan"),
                 end=""
             )
             outfile.write_text(outdata.file)  # typer.unstyle(outdata) also works
             typer.secho("Done", fg="green")
-            # typer.launch doesn't appear to work on wsl tries to use ps to launch
+            # typer.launch doesn't appear to work on wsl tries to use ps to launch using linux dir delim
             # typer.echo("Opening config directory")
-            # typer.launch(str(outfile), locate=True)
+            # typer.launch(str(outfile.parent), locate=True)
 
     # else:
     #     typer.echo("No Data Returned")
@@ -357,7 +388,7 @@ def template(operation: TemplateLevel1 = typer.Argument(...),
         if what == "variable":
             if variable and value and device:
                 # ses = utils.spinner(SPIN_TXT_AUTH, CentralApi)
-                cache = Cache(session)
+                # cache = Cache(session)
                 device = cache.get_dev_identifier(device)
                 payload = {"variables": {variable: value}}
                 _resp = session.update_variables(device, payload)
@@ -414,20 +445,29 @@ def do(what: DoArgs = typer.Argument(...),
     if not args1:
         typer.secho("Operation Requires additional Argument: [serial #|name|ip address|mac address]", fg="red")
         typer.echo("Examples:")
-        typer.echo(f"> do {what} nash-idf21-sw1 {'2' if what.startswith('bounce') else ''}")
-        typer.echo(f"> do {what} 10.0.30.5 {'2' if what.startswith('bounce') else ''}")
-        typer.echo(f"> do {what} f40343-a0b1c2 {'2' if what.startswith('bounce') else ''}")
-        typer.echo(f"> do {what} f4:03:43:a0:b1:c2 {'2' if what.startswith('bounce') else ''}")
+        if what.startswith('bounce'):
+            typer.echo(f"> do {what} nash-idf21-sw1 2")
+            typer.echo(f"> do {what} 10.0.30.5 2")
+            typer.echo(f"> do {what} f40343-a0b1c2 2")
+            typer.echo(f"> do {what} f4:03:43:a0:b1:c2 2")
+        elif what.startswith('move'):
+            typer.echo(f"> do {what} nash-idf21-sw1 <Group to Move device to>")
         typer.echo("\nWhen Identifying device by Mac Address most commmon MAC formats are accepted.\n")
         raise typer.Exit(1)
     else:
-        if what.startswith("bounce") and not args2:
-            typer.secho("Operation Requires additional Argument: <port #>", fg="red")
+        if (what.startswith("bounce") or what == "move") and not args2:
+            # TODO need more help for newer options
+            typer.secho("Operation Requires additional Argument: <port #> or <group>", fg="red")
             typer.echo("Example:")
             typer.echo(f"> do {what} {args1} 2")
             raise typer.Exit(1)
 
-        cache = Cache(session)
+        # cache = Cache(session)
+
+        if what == "move":
+            what = "move_dev_to_group"
+            args2 = cache.get_group_identifier(args2)  # group name
+
         serial = cache.get_dev_identifier(args1)
         kwargs = {
             "serial_num": serial,
@@ -436,12 +476,21 @@ def do(what: DoArgs = typer.Argument(...),
     # -- // do the Command \\ --
     if yes or typer.confirm(typer.style(f"Please Confirm {what} {args1} {args2}", fg="cyan")):
         resp = session.request(getattr(session, what.replace("-", "_")), args2, **kwargs)
-        typer.echo(resp)
+        typer.secho(str(resp), fg="green" if resp else "red")
         if resp.ok:
-            typer.echo(f"{typer.style('Success', fg='green')} command Queued.")
-            # always returns queued on success even if the task is done
-            resp = session.request(session.get_task_status, resp.task_id)
-            typer.secho(f"Task Status: {resp.get('reason', '')}, State: {resp.state}", fg="green" if resp.ok else "red")
+            # typer.echo(f"{typer.style('Success', fg='green')} command Queued.")
+            if resp.get("task_id"):
+                # TODO always returns queued on success even if the task is done. wtf?
+                resp = session.request(session.get_task_status, resp.task_id)
+                typer.secho(str(resp), fg="green" if resp else "red")
+                # typer.secho(f"Task Status: {resp.get('reason', '')}, State: {resp.state}", fg="green" if resp.ok else "red")
+            # -- Don't think this is necessary cache is only used for identifier lookup group being inaccurate ... no impact
+            # -- if it becomes necessary old_group needs to be retrieved prior to initiating move...
+            # elif what.startswith("move"):  # After device moved to new group, update cache for that device
+            #     old_group = cache.DevDB.search(cache.Q.serial == 'CN29FP403H')[-1].get("group")
+            #     typer.secho(f" -- Updating cache for {serial} Group: {old_group} --> {args2} -- ")
+            #     r = cache.DevDB.update({'group': args2}, cache.Q.serial == serial)
+            #     typer.secho("Done", fg="green") if r else typer.secho("Error", fg="red")
 
     else:
         raise typer.Abort()
@@ -542,6 +591,14 @@ def refresh(what: RefreshWhat = typer.Argument(...),
 @app.command()
 def method_test(method: str = typer.Argument(...),
                 kwargs: List[str] = typer.Argument(None),
+                do_json: bool = typer.Option(True, "--json", is_flag=True, help="Output in JSON"),
+                do_yaml: bool = typer.Option(False, "--yaml", is_flag=True, help="Output in YAML"),
+                do_csv: bool = typer.Option(False, "--csv", is_flag=True, help="Output in CSV"),
+                do_table: bool = typer.Option(False, "--simple", is_flag=True, help="Output in Table"),
+                do_rich: bool = typer.Option(False, "--rich", is_flag=True, help="Alpha Testing rich formatter"),
+                outfile: Path = typer.Option(None, help="Output to file (and terminal)", writable=True),
+                no_pager: bool = typer.Option(False, "--no-pager", help="Disable Paged Output"),
+                update_cache: bool = typer.Option(False, "-U", hidden=True),  # Force Update of cache for testing
                 debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",
                                            callback=debug_callback),
                 account: str = typer.Option("central_info",
@@ -569,11 +626,31 @@ def method_test(method: str = typer.Argument(...),
     kwargs = [k.split("=") for k in kwargs if "=" in k]
     kwargs = {k[0]: k[1] for k in kwargs}
 
-    typer.secho(f"session.{method}({(args)}, {kwargs})", fg="green")
-    resp = asyncio.run(getattr(session, method)(*args, **kwargs))
+    typer.secho(f"session.{method}({', '.join(a for a in args)}, "
+                f"{', '.join([f'{k}={kwargs[k]}' for k in kwargs]) if kwargs else ''})", fg="cyan")
+    resp = session.request(getattr(session, method), *args, **kwargs)
 
     for k, v in resp.__dict__.items():
-        typer.echo(f"{k}: {v}")
+        if k != "output":
+            if debug or not k.startswith("_"):
+                typer.echo(f"  {typer.style(k, fg='cyan')}: {v}")
+
+    data = eval_resp(resp, pad=2)
+
+    if data:
+        if do_yaml is True:
+            tablefmt = "yaml"
+        elif do_csv is True:
+            tablefmt = "csv"
+        elif do_rich is True:
+            tablefmt = "rich"
+        elif do_table is True:
+            tablefmt = "simple"
+        else:
+            tablefmt = "json"
+
+        typer.echo(f"\n{typer.style('output', fg='cyan')}:")
+        display_results(data, tablefmt=tablefmt, pager=not no_pager, outfile=outfile)
 
 
 @app.callback()

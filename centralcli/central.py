@@ -68,14 +68,7 @@ def get_conn_from_file(account_name, logger: MyLogger = log):
     token_store = config.get("token_store", DEFAULT_TOKEN_STORE)
     ssl_verify = config.get("ssl_verify", True)
 
-    kwargs = {
-        "central_info": central_info,
-        "token_store": token_store,
-        "ssl_verify": ssl_verify,
-        "logger": logger
-    }
-
-    conn = ArubaCentralBase(**kwargs)
+    conn = ArubaCentralBase(central_info, token_store=token_store, logger=logger, ssl_verify=ssl_verify)
     token_cache = Path(tokenLocalStoreUtil(token_store,
                                            central_info["customer_id"],
                                            central_info["client_id"]))
@@ -91,6 +84,10 @@ def get_conn_from_file(account_name, logger: MyLogger = log):
                 conn.central_info["token"] = cache_token
             else:
                 conn.central_info["retry_token"] = cache_token
+
+            # Compare tokens and remove retry token if they are the same.  Rare scenario
+            if conn.central_info["retry_token"]["refresh_token"] == conn.central_info["token"]["refresh_token"]:
+                del conn.central_info["retry_token"]
     else:
         if not conn.storeToken(conn.central_info.get("token")):
             log.warning("Failed to Store Token and token cache doesn't exist yet.", show=True)
@@ -380,29 +377,28 @@ class CentralApi(Session):
 
     async def get_all_devices(self) -> Response:  # VERIFIED
         url = "/platform/device_inventory/v1/devices"
-        _output = []
-        resp = None
-        for dev_type in ["iap", "switch", "gateway"]:
-            params = {"sku_type": dev_type}
-            resp = await self.get(url, params=params)
-            if not resp.ok:
-                break
-            _output = [*_output, *resp.output["devices"]]
+        dev_types = ["iap", "switch", "gateway"]
 
-        if _output:
-            resp.output = _output
+        # loop = asyncio.get_event_loop()
+        tasks = [self.get(url, params={"sku_type": dev_type})
+                 for dev_type in dev_types]
+        _ap, _switch, _gateway = await asyncio.gather(*tasks)
+        # loop.close()
 
-        return resp
+        _ap.output = [*_ap.output, *_switch.output, *_gateway.output]
+        _ap.url = str(_ap.url).replace("sku_type=iap", "sku_type=<3 calls: ap, switch, gw>")
+        return _ap
 
     async def get_all_devicesv2(self, **kwargs) -> Response:  # REVERIFIED
+        dev_types = ["aps", "switches", "gateways"]
         _output = {}
-        resp = None
 
-        for dev_type in ["aps", "switches", "gateways"]:
-            resp = await self.get_devices(dev_type, **kwargs)
-            if not resp.ok:
-                break
-            _output[dev_type] = resp.output  # [dict, ...]
+        tasks = [self.get_devices(dev_type, **kwargs)
+                 for dev_type in dev_types]
+        ap, sw, gw = await asyncio.gather(*tasks)
+        resp = ap
+        vals = [ap.output, sw.output, gw.output]
+        _output = {k: utils.listify(v) for k, v in zip(dev_types, vals) if v}
 
         if _output:
             # return just the keys common across all device types
@@ -638,7 +634,7 @@ class CentralApi(Session):
                   }
 
         # resp = requests.post(self.central.vars["base_url"] + url, headers=headers, json=payload)
-        return await self.post(url, payload=payload)
+        return await self.post(url, json_data=payload)
 
     async def get_audit_logs(self, log_id: str = None) -> Response:
         """Get all audit logs or details about a specifc log from Aruba Central
@@ -694,6 +690,42 @@ class CentralApi(Session):
             "count": 250
         }
         return await self.get(url, params=params)
+
+    async def get_ap_lldp_neighbor(self, device_serial: str) -> Response:
+        url = f"/topology_external_api/apNeighbors/{device_serial}"
+        return await self.get(url)
+
+    async def do_multi_group_snapshot(self, backup_name: str, include_groups: Union[list, List[str]] = None,
+                                      exclude_groups: Union[list, List[str]] = None, do_not_delete: bool = False) -> Response:
+        """"Create new configuration backup for multiple groups."
+
+        Args:
+            backup_name (str): Name of Backup
+            include_groups (Union[list, List[str]], optional): Groups to include in Backup. Defaults to None.
+            exclude_groups (Union[list, List[str]], optional): Groups to Exclude in Backup. Defaults to None.
+            do_not_delete (bool, optional): Flag to represent if the snapshot can be deleted automatically
+                by system when creating new snapshot or not. Defaults to False.
+
+        *Either include_groups or exclude_groups should be provided, but not both.
+
+        Returns:
+            Response: Response Object
+        """
+        url = "/configuration/v1/groups/snapshot/backups"
+        include_groups = utils.listify(include_groups)
+        exclude_groups = utils.listify(exclude_groups)
+        payload = {
+            "backup_name": backup_name,
+            "do_not_delete": do_not_delete,
+            "include_groups": include_groups,
+            "exclude_groups": exclude_groups
+        }
+        payload = self.strip_none(payload)
+        return await self.post(url, json_data=payload)
+
+    async def get_snapshots_by_group(self, group: str):
+        url = f"/configuration/v1/groups/{group}/snapshots"
+        return await self.get(url)
 
     # TODO move to caas.py
     async def caasapi(self, group_dev: str, cli_cmds: list = None):
