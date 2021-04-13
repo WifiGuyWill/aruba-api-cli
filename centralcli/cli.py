@@ -1,610 +1,345 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import asyncio
-from pathlib import Path
-from typing import Any, List, Union
-from tinydb import TinyDB
+from enum import Enum
+import os
 import sys
+import importlib
+from pathlib import Path
+from typing import List
+
 import typer
 
 # Detect if called from pypi installed package or via cloned github repo (development)
 try:
-    from centralcli import config, log, utils, Cache, Response, caas
+    from centralcli import clibatch, clicaas, clido, clishow, clidel, cliadd, cliupdate, cliupgrade, cliclone, cli, log
 except (ImportError, ModuleNotFoundError) as e:
     pkg_dir = Path(__file__).absolute().parent
     if pkg_dir.name == "centralcli":
         sys.path.insert(0, str(pkg_dir.parent))
-        from centralcli import config, log, utils, Cache, Response, caas
+        from centralcli import clibatch, clicaas, clido, clishow, clidel, cliadd, cliupdate, cliupgrade, cliclone, cli, log
     else:
         print(pkg_dir.parts)
         raise e
 
-from centralcli.central import CentralApi
-# import caas
-from centralcli.constants import (DoArgs, ShowArgs, SortOptions, StatusOptions, TemplateLevel1,
-                                  RefreshWhat, arg_to_what, devices)
+from centralcli.central import CentralApi  # noqa
+from centralcli.constants import RefreshWhat, IdenMetaVars, BounceArgs
+
+iden = IdenMetaVars()
+
+CONTEXT_SETTINGS = {
+    # "token_normalize_func": lambda x: cli.normalize_tokens(x),
+    "help_option_names": ["?", "--help"]
+}
+
+app = typer.Typer(context_settings=CONTEXT_SETTINGS)
+app.add_typer(clishow.app, name="show",)
+app.add_typer(clido.app, name="do",)
+app.add_typer(clidel.app, name="delete")
+app.add_typer(cliadd.app, name="add",)
+app.add_typer(cliclone.app, name="clone",)
+app.add_typer(cliupdate.app, name="update",)
+app.add_typer(cliupgrade.app, name="upgrade",)
+app.add_typer(clibatch.app, name="batch",)
+app.add_typer(clicaas.app, name="caas", hidden=True,)
 
 
-TinyDB.default_table_name = "devices"
-
-STRIP_KEYS = ["data", "devices", "mcs", "group", "clients", "sites", "switches", "aps"]
-SPIN_TXT_AUTH = "Establishing Session with Aruba Central API Gateway..."
-SPIN_TXT_CMDS = "Sending Commands to Aruba Central API Gateway..."
-SPIN_TXT_DATA = "Collecting Data from Aruba Central API Gateway..."
-tty = utils.tty
-
-app = typer.Typer()
+class MoveArgs(str, Enum):
+    site = "site"
+    group = "group"
 
 
-# TODO ?? make more sense to have this return the ArubaCentralBase object ??
-def account_name_callback(ctx: typer.Context, account: str):
-    if ctx.resilient_parsing:  # tab completion, return without validating
-        return account
+@app.command(
+    short_help="Move device(s) to a defined group and/or site",
+    help="Move device(s) to a defined group and/or site.",
+)
+def move(
+    device: List[str, ] = typer.Argument(None, metavar=f"[{iden.dev} ...]", autocompletion=cli.cache.dev_kwarg_completion,),
+    kw1: str = typer.Argument(
+        None,
+        metavar="",
+        show_default=False,
+        hidden=True,
+    ),
+    kw1_val: str = typer.Argument(
+        None,
+        metavar="[site <SITE>]",
+        show_default=False,
+    ),
+    kw2: str = typer.Argument(
+        None, metavar="",
+        show_default=False,
+        hidden=True,
+    ),
+    kw2_val: str = typer.Argument(
+        None,
+        metavar="[group <GROUP>]",
+        show_default=False,
+        help="[site and/or group required]",
+    ),
+    _group: str = typer.Option(
+        None,
+        "--group",
+        help="Group to Move device(s) to",
+        hidden=True,
+        autocompletion=cli.cache.group_completion,
+    ),
+    _site: str = typer.Option(
+        None, "--site",
+        help="Site to move device(s) to",
+        hidden=True,
+        autocompletion=cli.cache.site_completion,
+    ),
+    yes: bool = typer.Option(False, "-Y", help="Bypass confirmation prompts - Assume Yes"),
+    debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging"),
+    default: bool = typer.Option(False, "-d", is_flag=True, help="Use default central account", show_default=False,),
+    account: str = typer.Option("central_info",
+                                envvar="ARUBACLI_ACCOUNT",
+                                help="The Aruba Central Account to use (must be defined in the config)",
+                                autocompletion=cli.cache.account_completion),
+    # yes_: bool = typer.Option(False, "-y", hidden=True),
+) -> None:
+    central = cli.central
 
-    if account in config.data:
-        config.account = account
-        global session
-        session = CentralApi(account)
-        global cache
-        cache = Cache(session)
-        cache.update_meta_db()
-        return account
-    else:
-        strip_keys = ['central_info', 'ssl_verify', 'token_store']
-        typer.echo(f"{typer.style('ERROR:', fg=typer.colors.RED)} "
-                   f"The specified account: '{account}' is not defined in the config @\n"
-                   f"{config.file}\n\n")
-
-        _accounts = [k for k in config.data.keys() if k not in strip_keys]
-        if _accounts:
-            typer.echo(f"The following accounts are defined {_accounts}\n"
-                       f"The default account 'central_info' is used if no account is specified via --account flag.\n"
-                       f"or the ARUBACLI_ACCOUNT environment variable.\n")
+    group, site, = None, None
+    for a, b in zip([kw1, kw2], [kw1_val, kw2_val]):
+        if a == "group":
+            group = b
+        elif a == "site":
+            site = b
         else:
-            if not config.data:
-                # TODO prompt user for details
-                typer.secho("Configuration doesn't exist", fg="red")
+            device += tuple([aa for aa in [a, b] if aa and aa not in ["group", "site"]])
+
+    if not device:
+        typer.echo("Error: Missing argument '[[name|ip|mac-address|serial] ...]'.")
+        raise typer.Exit(1)
+
+    group = group or _group
+    site = site or _site
+
+    if not group and not site:
+        typer.secho("Missing Required Argument, group and/or site is required.")
+        raise typer.Exit(1)
+
+    dev = [cli.cache.get_dev_identifier(d) for d in device]
+    devs_by_type = {
+    }
+    devs_by_site = {
+    }
+    dev_all_names, dev_all_serials, = [], []
+    for d in dev:
+        if d.generic_type not in devs_by_type:
+            devs_by_type[d.generic_type] = [d]
+        else:
+            devs_by_type[d.generic_type] += [d]
+        dev_all_names += [d.name]
+        dev_all_serials += [d.serial]
+
+        if site and d.site:
+            if f"{d.site}~|~{d.generic_type}" not in devs_by_site:
+                devs_by_site[f"{d.site}~|~{d.generic_type}"] = [d]
             else:
-                typer.secho("No accounts defined in config", fg="red")
+                devs_by_site[f"{d.site}~|~{d.generic_type}"] += [d]
 
-        if account != "central_info" and "central_info" not in config.data:
-            typer.echo(f"{typer.style('WARNING:', fg='yellow')} "
-                       f"'central_info' is not defined in the config.  This is the default when not overriden by\n"
-                       f"--account parameter or ARUBACLI_ACCOUNT environment variable.")
-
-        raise typer.Exit(code=1)
-
-
-def debug_callback(debug: bool):
-    if debug:
-        log.DEBUG = config.debug = debug
-
-
-@app.command()
-def bulk_edit(input_file: str = typer.Argument(None)):
-    cli = caas.BuildCLI(session=session)
-    # TODO log cli
-    if cli.cmds:
-        for dev in cli.data:
-            group_dev = f"{cli.data[dev]['_common'].get('group')}/{dev}"
-            resp = session.caasapi(group_dev, cli.cmds)
-            caas.eval_caas_response(resp)
-
-
-def eval_resp(resp: Response, pad: int = 0) -> Any:
-    if not resp.ok:
-        msg = f"{' ' * pad}{typer.style('ERROR:', fg=typer.colors.RED)} "
-        if isinstance(resp.output, dict):
-            msg += f"{resp.output.get('description', resp.error).replace('Error: ', '')}"
-        else:
-            msg += str(resp.output)
-
-        typer.echo(msg)
-    else:
-        return resp.output
-
-
-# TODO combine eval_resp and display_results
-def display_results(data: Union[List[dict], List[str]], tablefmt: str = "simple",
-                    pager=True, outfile: Path = None) -> Union[list, dict]:
-    outdata = utils.output(data, tablefmt)
-    typer.echo_via_pager(outdata) if pager and len(outdata) > tty.rows else typer.echo(outdata)
-
-    # -- // Output to file \\ --
-    if outfile and outdata:
-        if outfile.parent.resolve() == config.base_dir.resolve():
-            config.outdir.mkdir(exist_ok=True)
-            outfile = config.outdir / outfile
-
-        print(
-            typer.style(f"\nWriting output to {outfile}... ", fg="cyan"),
-            end=""
-        )
-        outfile.write_text(outdata.file)  # typer.unstyle(outdata) also works
-        typer.secho("Done", fg="green")
-
-
-show_help = ["all (devices)", "device[s] (same as 'all' unless followed by device identifier)", "switch[es]", "ap[s]",
-             "gateway[s]", "group[s]", "site[s]", "clients", "template[s]", "variables", "certs"]
-args_metavar_dev = "[name|ip|mac-address|serial]"
-args_metavar_site = "[name|site_id|address|city|state|zip]"
-args_metavar = f"""Optional Identifying Attribute: device: {args_metavar_dev} site: {args_metavar_site}"""
-
-
-@app.command(short_help="Show Details about Aruba Central Objects")
-def show(what: ShowArgs = typer.Argument(..., metavar=f"[{f'|'.join(show_help)}]"),
-         args: List[str] = typer.Argument(None, metavar=args_metavar, hidden=False),
-         #  args: str = typer.Argument(None, hidden=True),
-         group: str = typer.Option(None, metavar="<Device Group>", help="Filter by Group", ),  # TODO cache group names
-         label: str = typer.Option(None, metavar="<Device Label>", help="Filter by Label", ),
-         dev_id: int = typer.Option(None, "--id", metavar="<id>", help="Filter by id"),
-         status: StatusOptions = typer.Option(None, metavar="[up|down]", help="Filter by device status"),
-         state: StatusOptions = typer.Option(None, hidden=True),  # alias for status
-         pub_ip: str = typer.Option(None, metavar="<Public IP Address>", help="Filter by Public IP"),
-         name: str = typer.Option(None, metavar="<Template Name>", help="[Templates] Filter by Template Name"),
-         device_type: str = typer.Option(None, "--dev-type", metavar="[IAP|ArubaSwitch|MobilityController|CX]>",
-                                         help="[Templates] Filter by Device Type"),
-         version: str = typer.Option(None, metavar="<version>", help="[Templates] Filter by dev version Template is assigned to"),
-         model: str = typer.Option(None, metavar="<model>", help="[Templates] Filter by model"),
-         #  variablised: str = typer.Option(False, "--with-vars",
-         #                                  help="[Templates] Show Template with variable place-holders and vars."),
-         do_stats: bool = typer.Option(False, "--stats", is_flag=True, help="Show device statistics"),
-         do_clients: bool = typer.Option(False, "--clients", is_flag=True, help="Calculate client count (per device)"),
-         sort_by: SortOptions = typer.Option(None, "--sort"),
-         do_json: bool = typer.Option(False, "--json", is_flag=True, help="Output in JSON"),
-         do_yaml: bool = typer.Option(False, "--yaml", is_flag=True, help="Output in YAML"),
-         do_csv: bool = typer.Option(False, "--csv", is_flag=True, help="Output in CSV"),
-         do_rich: bool = typer.Option(False, "--rich", is_flag=True, help="Alpha Testing rich formatter"),
-         outfile: Path = typer.Option(None, help="Output to file (and terminal)", writable=True),
-         no_pager: bool = typer.Option(False, "--no-pager", help="Disable Paged Output"),
-         update_cache: bool = typer.Option(False, "-U", hidden=True),  # Force Update of cache for testing
-         debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",
-                                    callback=debug_callback),
-         account: str = typer.Option("central_info",
-                                     envvar="ARUBACLI_ACCOUNT",
-                                     help="The Aruba Central Account to use (must be defined in the config)",
-                                     callback=account_name_callback),
-         ):
-
-    what = arg_to_what.get(what)
-
-    # load cache to support friendly identifiers
-    # cache = Cache(session, refresh=update_cache)
-    cache(refresh=update_cache)
+    _s = "," if len(dev_all_names) > 2 else " &"
+    _s = typer.style(_s, fg="bright_green")
+    _msg_devs = f'{_s} '.join(typer.style(n, fg="reset") for n in dev_all_names)
+    _msg_in_site = "" if not devs_by_site else typer.style(" (devices will be removed from current sites.)", fg="red")
+    _msg_end = typer.style("?", fg="bright_green")
+    _msg = None
 
     if group:
-        group = cache.get_group_identifier(group)
-        if not group:
-            raise typer.Exit(1)
-
-    # -- // Peform GET Call \\ --
-    resp = None
-    if what in devices:
-        params = {
-            "group": group,
-            "status": None if not status else status.title(),
-            "label": label,
-            "public_ip_address": pub_ip,
-            "calculate_client_count": do_clients,
-            "show_resource_details": do_stats,
-            "sort": None if not sort_by else sort_by._value_
-        }
-
-        # status and state keywords both allowed
-        if params["status"] is None and state is not None:
-            params["status"] = state.title()
-
-        params = {k: v for k, v in params.items() if v is not None}
-
-        if what == "device":
-            if args:
-                what, serial = cache.get_dev_identifier(args, ret_field="type-serial")
-
-                if what and serial:
-                    resp = session.request(session.get_dev_details, what, serial)
-            else:  # show devices ... equiv to show all
-                resp = session.request(session.get_all_devicesv2)
-
-        elif what == "all":
-            # if no params (expected result may differ) update cache if not updated this session and return results from there
-            if len(params) == 2 and list(params.values()).count(False) == 2:
-                if session.get_all_devicesv2 not in cache.updated:
-                    asyncio.run(cache.update_dev_db())
-                    # cache = Cache(session, refresh=True)
-
-                resp = Response(output=cache.devices)
-            else:  # will only run if user specifies params (filters)
-                resp = session.request(session.get_all_devicesv2, **params)
-        elif args:
-            serial = cache.get_dev_identifier(args)
-            resp = session.request(session.get_dev_details, what, serial)
-            # device details is a lot of data default to yaml output, default horizontal would typically overrun tty
-            if True not in [do_csv, do_json]:
-                do_yaml = True
+        _group = cli.cache.get_group_identifier(group)
+        _msg = [
+            typer.style("Please Confirm: move", fg="bright_green"),
+            _msg_devs,
+            typer.style("to group", fg="bright_green"),
+            typer.style((_group.name), fg='reset'),
+        ]
+        _msg = f"{' '.join(_msg)}{_msg_end}"
+    if site:
+        _site = cli.cache.get_site_identifier(site)
+        if not _msg:
+            _msg = [
+                typer.style("Please Confirm: move", fg="bright_green"),
+                _msg_devs,
+                typer.style("to site", fg="bright_green"),
+                typer.style((_site.name), fg='reset'),
+            ]
+            _msg = f"{' '.join(_msg)}{_msg_in_site}{_msg_end}"
         else:
-            # resp = session.get_devices(what, **params)
-            # resp = asyncio.run(session.get_devices(what, **params))
-            resp = session.request(session.get_devices, what, **params)
+            _msg_site = typer.style((_site.name), fg=typer.colors.RESET)
+            _msg = f'{_msg.replace("?", "")} {typer.style(f"and site", fg="bright_green")} {_msg_site}{_msg_in_site}{_msg_end}'
 
-    elif what == "groups":
-        if session.get_all_groups not in cache.updated:
-            asyncio.run(cache.update_group_db())
+    resp, site_rm_resp = None, None
+    confirmed = True if yes or typer.confirm(_msg, abort=True) else False
 
-        resp = Response(output=cache.groups)
-        # resp = asyncio.run(session.get_all_groups())  # List[str]
+    # If devices are associated with a site currently remove them from that site first
+    if confirmed and _site and devs_by_site:
+        site_remove_reqs = []
+        for [site_name, dev_type], devs in zip([k.split("~|~") for k in devs_by_site.keys()], list(devs_by_site.values())):
+            site_remove_reqs += [
+                central.BatchRequest(
+                    central.remove_devices_from_site,
+                    cli.cache.get_site_identifier(site_name).id,
+                    serial_nums=[d.serial for d in devs],
+                    device_type=dev_type,
+                )
+            ]
+        site_rm_resp = central.batch_request(site_remove_reqs)
+        if not all(r.ok for r in site_rm_resp):
+            cli.display_results(site_rm_resp, tablefmt="action", exit_on_fail=True)
 
-    elif what == "sites":
-        if args:
-            dev_id = cache.get_site_identifier(args)
+    # run both group and site move in parallel
+    if confirmed and _group and _site:
+        reqs = [central.BatchRequest(central.move_devices_to_group, _group.name, serial_nums=dev_all_serials)]
+        site_remove_reqs = []
+        for _type in devs_by_type:
+            serials = [d.serial for d in devs_by_type[_type]]
+            reqs += [
+                central.BatchRequest(central.move_devices_to_site, _site.id, serial_nums=serials, device_type=_type)
+            ]
 
-        if dev_id is None:
-            if session.get_all_sites not in cache.updated:
-                asyncio.run(cache.update_site_db())
-            # else:
-                # resp = asyncio.run(session.get_all_sites())
+        resp = central.batch_request(reqs)
 
-            resp = Response(output=cache.sites)
-        else:
-            resp = session.request(session.get_site_details, dev_id)
+    # only moving group via single API call
+    elif confirmed and _group:
+        resp = [
+            cli.central.request(cli.central.move_devices_to_group, _group.name, serial_nums=dev_all_serials)
+        ]
 
-    # -- // SHOW TEMPLATE \\ --
-    elif what == "template":
-        params = {
-            "name": name,
-            "device_type": device_type,  # valid = IAP, ArubaSwitch, MobilityController, CX
-            "version": version,
-            "model": model
-        }
+    # only moving site, potentially multiple calls (for each device_type)
+    elif confirmed and _site:
+        for _type in devs_by_type:
+            serials = [d.serial for d in devs_by_type[_type]]
+            reqs = [
+                central.BatchRequest(central.move_devices_to_site, _site.id, serial_nums=serials, device_type=_type)
+            ]
 
-        params = {k: v for k, v in params.items() if v is not None}
+        resp = central.batch_request(reqs)
 
-        if args:
-            if len(args) > 1:
-                log.error(f"Only expecting 1 argument for show template, ignoring {args[1:]}", show=True)
-            args = args[0]
+    if site_rm_resp:
+        resp = [*site_rm_resp, *resp]
 
-        if not args:
-            if not group:  # show templates
-                if session.get_all_templates not in cache.updated:
-                    asyncio.run(cache.update_template_db())
-
-                resp = Response(output=cache.templates)
-                # else:
-                #     resp = session.get_all_templates(**params)
-            else:  # show templates --group <group name>
-                resp = session.request(session.get_all_templates_in_group, group, **params)
-        elif group:  # show template <arg> --group <group_name>
-            _args = cache.get_template_identifier(args)
-            if _args:  # name of template
-                resp = session.request(session.get_template, group, args)
-            else:
-                _args = cache.get_dev_identifier(args)
-                if _args:
-                    typer.secho(f"{args} Does not match a Template name, but does match device with serial {_args}", fg="cyan")
-                    typer.secho(f"Fetching Variablised Template for {args}", fg="cyan")
-                    msg = (
-                        f"{typer.style(f'--group {group} is not required for device specific template output.  ', fg='cyan')}"
-                        f"{typer.style(f'ignoring --group {group}', fg='red')}"
-                        )
-                    typer.echo(msg)
-                    resp = session.request(session.get_variablised_template, _args)
-        else:  # provided args but no group
-            _args = cache.get_dev_identifier(args, retry=False)
-            if _args:  # assume arg is device identifier 1st
-                resp = session.request(session.get_variablised_template, _args)
-            else:  # next try template names
-                _args = cache.get_template_identifier(args, ret_field="group-name")
-                if _args:
-                    group, tmplt_name = _args[0], _args[1]
-                    resp = session.request(session.get_template, group, tmplt_name)
-                else:
-                    # typer.secho(f"No Match Found for {args} in Cachce")
-                    raise typer.Exit(1)
-
-    elif what == "variables":
-        # switch default output to json for show variables
-        if True not in [do_csv, do_yaml]:
-            do_json = True
-
-        if args and args != "all":
-            args = cache.get_dev_identifier(args)
-
-        resp = session.request(session.get_variables, args)
-
-    elif what == "certs":
-        resp = session.request(session.get_certificates)
-
-    elif what == "clients":
-        resp = session.request(session.get_clients, args)
-
-    elif what == "cache":
-        do_json = True
-        resp = Response(output=cache.all)
-
-    # TODO remove after verifying we never return a NoneType
-    if resp is None:
-        print("Developer Message: resp returned NoneType")
-
-    # TODO make this it's own function
-    data = eval_resp(resp)
-
-    if data:
-        if do_json is True:
-            tablefmt = "json"
-        elif do_yaml is True:
-            tablefmt = "yaml"
-        elif do_csv is True:
-            tablefmt = "csv"
-        elif do_rich is True:
-            tablefmt = "rich"
-        else:
-            tablefmt = "simple"
-
-        outdata = utils.output(data, tablefmt)
-        typer.echo_via_pager(outdata) if not no_pager and len(outdata) > tty.rows else typer.echo(outdata)
-
-        # -- // Output to file \\ --
-        if outfile and outdata:
-            if outfile.parent.resolve() == config.base_dir.resolve():
-                config.outdir.mkdir(exist_ok=True)
-                outfile = config.outdir / outfile
-
-            print(
-                typer.style(f"\nWriting output to {outfile}... ", fg="cyan"),
-                end=""
-            )
-            outfile.write_text(outdata.file)  # typer.unstyle(outdata) also works
-            typer.secho("Done", fg="green")
-            # typer.launch doesn't appear to work on wsl tries to use ps to launch using linux dir delim
-            # typer.echo("Opening config directory")
-            # typer.launch(str(outfile.parent), locate=True)
-
-    # else:
-    #     typer.echo("No Data Returned")
+    cli.display_results(resp, tablefmt="action", ok_status=500)
 
 
-@app.command()
-def template(operation: TemplateLevel1 = typer.Argument(...),
-             what: str = typer.Argument(None, hidden=False, metavar="['variable']",
-                                        help="Optional variable keyword to indicate variable update"),
-             device: str = typer.Argument(None, metavar=args_metavar_dev),
-             variable: str = typer.Argument(None, help="[Variable operations] What Variable To Update"),
-             value: str = typer.Argument(None, help="[Variable operations] The Value to assign"),
-             template: Path = typer.Option(None, help="Path to file containing new template"),
-             group: str = typer.Option(None, metavar="<Device Group>", help="Required for Update Template"),
-             device_type: str = typer.Option(None, "--dev-type", metavar="[IAP|ArubaSwitch|MobilityController|CX]>",
-                                             help="[Templates] Filter by Device Type"),
-             version: str = typer.Option(None, metavar="<version>", help="[Templates] Filter by version"),
-             model: str = typer.Option(None, metavar="<model>", help="[Templates] Filter by model"),
-             debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",
-                                        callback=debug_callback),
-             account: str = typer.Option("central_info",
-                                         envvar="ARUBACLI_ACCOUNT",
-                                         help="The Aruba Central Account to use (must be defined in the config)",
-                                         callback=account_name_callback),
-             ):
-    # TODO cache template names
-    if operation == "update":
-        if what == "variable":
-            if variable and value and device:
-                # ses = utils.spinner(SPIN_TXT_AUTH, CentralApi)
-                # cache = Cache(session)
-                device = cache.get_dev_identifier(device)
-                payload = {"variables": {variable: value}}
-                _resp = session.update_variables(device, payload)
-                if _resp:
-                    log.info(f"Template Variable Updated {variable} -> {value}", show=False)
-                    typer.echo(f"{typer.style('Success', fg=typer.colors.GREEN)}")
-                else:
-                    log.error(f"Template Update Variables {variable} -> {value} retuned error\n{_resp.output}", show=False)
-                    typer.echo(f"{typer.style('Error Returned', fg=typer.colors.RED)} {_resp.error}")
-        else:  # delete or add template, what becomes device/template identifier
-            kwargs = {
-                "group": group,
-                "name": what,
-                "device_type": device_type,
-                "version": version,
-                "model": model
-            }
-            payload = None
-            do_prompt = False
-            if template:
-                if not template.is_file() or template.stat().st_size > 0:
-                    typer.secho(f"{template} not found or invalid.", fg="red")
-                    do_prompt = True
-            else:
-                typer.secho("template file not provided (--template <path/to/file>)", fg="cyan")
-                do_prompt = True
-
-            if do_prompt:
-                payload = utils.get_multiline_input("Paste in new template contents then press CTRL-D", typer.secho, fg="cyan")
-                payload = "\n".join(payload).encode()
-
-            _resp = session.update_existing_template(**kwargs, template=template, payload=payload)
-            if _resp:
-                log.info(f"Template {what} Updated {_resp.output}", show=False)
-                typer.secho(_resp.output, fg="green")
-            else:
-                log.error(f"Template {what} Update from {template} Failed. {_resp.error}", show=False)
-                typer.secho(_resp.output, fg="red")
-
-
-@app.command()
-def do(what: DoArgs = typer.Argument(...),
-       args1: str = typer.Argument(..., metavar="Identifying Attributes: [serial #|name|ip address|mac address]"),
-       args2: str = typer.Argument(None, metavar="identifying attribute i.e. port #, required for some actions."),
-       yes: bool = typer.Option(False, "-Y", metavar="Bypass confirmation prompts - Assume Yes"),
-       debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",
-                                  callback=debug_callback),
-       account: str = typer.Option("central_info",
-                                   envvar="ARUBACLI_ACCOUNT",
-                                   help="The Aruba Central Account to use (must be defined in the config)",
-                                   callback=account_name_callback),
-       ) -> None:
-
-    if not args1:
-        typer.secho("Operation Requires additional Argument: [serial #|name|ip address|mac address]", fg="red")
-        typer.echo("Examples:")
-        if what.startswith('bounce'):
-            typer.echo(f"> do {what} nash-idf21-sw1 2")
-            typer.echo(f"> do {what} 10.0.30.5 2")
-            typer.echo(f"> do {what} f40343-a0b1c2 2")
-            typer.echo(f"> do {what} f4:03:43:a0:b1:c2 2")
-        elif what.startswith('move'):
-            typer.echo(f"> do {what} nash-idf21-sw1 <Group to Move device to>")
-        typer.echo("\nWhen Identifying device by Mac Address most commmon MAC formats are accepted.\n")
-        raise typer.Exit(1)
-    else:
-        if (what.startswith("bounce") or what == "move") and not args2:
-            # TODO need more help for newer options
-            typer.secho("Operation Requires additional Argument: <port #> or <group>", fg="red")
-            typer.echo("Example:")
-            typer.echo(f"> do {what} {args1} 2")
-            raise typer.Exit(1)
-
-        # cache = Cache(session)
-
-        if what == "move":
-            what = "move_dev_to_group"
-            args2 = cache.get_group_identifier(args2)  # group name
-
-        serial = cache.get_dev_identifier(args1)
-        kwargs = {
-            "serial_num": serial,
-        }
-
-    # -- // do the Command \\ --
-    if yes or typer.confirm(typer.style(f"Please Confirm {what} {args1} {args2}", fg="cyan")):
-        resp = session.request(getattr(session, what.replace("-", "_")), args2, **kwargs)
+@app.command(short_help="Bounce Interface or PoE on Interface")
+def bounce(
+    what: BounceArgs = typer.Argument(...),
+    device: str = typer.Argument(..., metavar=iden.dev, autocompletion=cli.cache.dev_completion),
+    port: str = typer.Argument(..., autocompletion=lambda incomplete: []),
+    yes: bool = typer.Option(False, "-Y", help="Bypass confirmation prompts - Assume Yes"),
+    yes_: bool = typer.Option(False, "-y", hidden=True),
+    debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",),
+    default: bool = typer.Option(False, "-d", is_flag=True, help="Use default central account", show_default=False,),
+    account: str = typer.Option("central_info",
+                                envvar="ARUBACLI_ACCOUNT",
+                                help="The Aruba Central Account to use (must be defined in the config)",
+                                autocompletion=cli.cache.account_completion),
+) -> None:
+    yes = yes_ if yes_ else yes
+    dev = cli.cache.get_dev_identifier(device)
+    command = 'bounce_poe_port' if what == 'poe' else 'bounce_interface'
+    if yes or typer.confirm(typer.style(f"Please Confirm bounce {what} on {dev.name} port {port}", fg="cyan")):
+        resp = cli.central.request(cli.central.send_bounce_command_to_device, dev.serial, command, port)
         typer.secho(str(resp), fg="green" if resp else "red")
-        if resp.ok:
-            # typer.echo(f"{typer.style('Success', fg='green')} command Queued.")
-            if resp.get("task_id"):
-                # TODO always returns queued on success even if the task is done. wtf?
-                resp = session.request(session.get_task_status, resp.task_id)
-                typer.secho(str(resp), fg="green" if resp else "red")
-                # typer.secho(f"Task Status: {resp.get('reason', '')}, State: {resp.state}", fg="green" if resp.ok else "red")
-            # -- Don't think this is necessary cache is only used for identifier lookup group being inaccurate ... no impact
-            # -- if it becomes necessary old_group needs to be retrieved prior to initiating move...
-            # elif what.startswith("move"):  # After device moved to new group, update cache for that device
-            #     old_group = cache.DevDB.search(cache.Q.serial == 'CN29FP403H')[-1].get("group")
-            #     typer.secho(f" -- Updating cache for {serial} Group: {old_group} --> {args2} -- ")
-            #     r = cache.DevDB.update({'group': args2}, cache.Q.serial == serial)
-            #     typer.secho("Done", fg="green") if r else typer.secho("Error", fg="red")
+        # !! removing this for now Central ALWAYS returns:
+        # !!   reason: Sending command to device. state: QUEUED, even after command execution.
+        # if resp and resp.get('task_id'):
+        #     resp = cli.central.request(session.get_task_status, resp.task_id)
+        #     typer.secho(str(resp), fg="green" if resp else "red")
 
     else:
         raise typer.Abort()
 
 
-@app.command()
-def add_vlan(group_dev: str = typer.Argument(...), pvid: str = typer.Argument(...), ip: str = typer.Argument(None),
-             mask: str = typer.Argument("255.255.255.0"), name: str = None, description: str = None,
-             interface: str = None, vrid: str = None, vrrp_ip: str = None, vrrp_pri: int = None):
-    cmds = []
-    cmds += [f"vlan {pvid}", "!"]
-    if name:
-        cmds += [f"vlan-name {name}", "!", f"vlan {name} {pvid}", "!"]
-    if ip:
-        _fallback_desc = f"VLAN{pvid}-SVI"
-        cmds += [f"interface vlan {pvid}", f"description {description or name or _fallback_desc}", f"ip address {ip} {mask}", "!"]
-    if vrid:
-        cmds += [f"vrrp {vrid}", f"ip address {vrrp_ip}", f"vlan {pvid}"]
-        if vrrp_pri:
-            cmds += [f"priority {vrrp_pri}"]
-        cmds += ["no shutdown", "!"]
+@app.command(short_help="Remove a device from a site.")
+def remove(
+    devices: List[str] = typer.Argument(..., metavar=iden.dev_many, autocompletion=cli.cache.remove_completion),
+    # _device: List[str] = typer.Argument(..., metavar=iden.dev, autocompletion=cli.cache.completion),
+    # _site_kw: RemoveArgs = typer.Argument(None),
+    site: str = typer.Argument(
+        ...,
+        metavar="[site <SITE>]",
+        show_default=False,
+        autocompletion=cli.cache.remove_completion
+    ),
+    yes: bool = typer.Option(False, "-Y", help="Bypass confirmation prompts - Assume Yes"),
+    yes_: bool = typer.Option(False, "-y", hidden=True),
+    debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",),
+    default: bool = typer.Option(False, "-d", is_flag=True, help="Use default central account", show_default=False,),
+    account: str = typer.Option("central_info",
+                                envvar="ARUBACLI_ACCOUNT",
+                                help="The Aruba Central Account to use (must be defined in the config)",
+                                autocompletion=cli.cache.account_completion),
+) -> None:
+    yes = yes_ if yes_ else yes
+    devices = (d for d in devices if d != "site")
+    devices = [cli.cache.get_dev_identifier(dev) for dev in devices]
+    site = cli.cache.get_site_identifier(site)
 
-    # TODO move command gen to BuildCLI
-    caas.eval_caas_response(session.caasapi(group_dev, cmds))
-
-
-@app.command()
-def import_vlan(import_file: str = typer.Argument(config.stored_tasks_file),
-                key: str = None):
-    if import_file == config.stored_tasks_file and not key:
-        typer.echo("key is required when using the default import file")
-
-    data = utils.read_yaml(import_file)
-    if key:
-        data = data.get(key)
-
-    if data:
-        args = data.get("arguments", [])
-        kwargs = data.get("options", {})
-        add_vlan(*args, **kwargs)
-
-
-@app.command()
-def batch(import_file: str = typer.Argument(config.stored_tasks_file),
-          command: str = None, key: str = None):
-
-    if import_file == config.stored_tasks_file and not key:
-        typer.echo("key is required when using the default import file")
-        raise typer.Exit()
-
-    data = utils.read_yaml(import_file)
-    if key:
-        data = data.get(key)
-
-    if not data:
-        _msg = typer.style(f"{key} not found in {import_file}.  No Data to Process", fg=typer.colors.RED, bold=True)
-        typer.echo(_msg)
-    else:
-        args = data.get("arguments", [])
-        kwargs = data.get("options", {})
-        cmds = data.get("cmds", [])
-
-        if not args:
-            typer.secho("import data requires an argument specifying the group / device")
-            raise typer.Exit(1)
-
-        if command:
-            try:
-                exec(f"fn = {command}")
-                fn(*args, **kwargs)  # type: ignore # NoQA
-            except AttributeError:
-                typer.echo(f"{command} doesn't appear to be valid")
-        elif cmds:
-            kwargs = {**kwargs, **{"cli_cmds": cmds}}
-            resp = utils.spinner(SPIN_TXT_CMDS, session.caasapi, *args, **kwargs)
-            caas.eval_caas_response(resp)
+    # TODO add confirmation method builder to output class
+    if yes or typer.confirm(
+        typer.style(f"Please Confirm remove {', '.join([dev.name for dev in devices])} from site {site.name}", fg="cyan")
+    ):
+        devs_by_type = {
+        }
+        for d in devices:
+            if d.generic_type not in devs_by_type:
+                devs_by_type[d.generic_type] = [d.serial]
+            else:
+                devs_by_type[d.generic_type] += [d.serial]
+        reqs = [
+            cli.central.BatchRequest(
+                cli.central.remove_devices_from_site,
+                site.id,
+                serial_nums=serials,
+                device_type=dev_type) for dev_type, serials in devs_by_type.items()
+        ]
+        resp = cli.central.batch_request(reqs)
+        cli.display_results(resp, tablefmt="action")
 
 
-@app.command()
+@app.command(hidden=True)
 def refresh(what: RefreshWhat = typer.Argument(...),
-            debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",
-                                       callback=debug_callback),
+            debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",),
+            default: bool = typer.Option(False, "-d", is_flag=True, help="Use default central account", show_default=False,),
             account: str = typer.Option("central_info",
                                         envvar="ARUBACLI_ACCOUNT",
                                         help="The Aruba Central Account to use (must be defined in the config)",
-                                        callback=account_name_callback),):
+                                        autocompletion=cli.cache.account_completion),
+            ):
     """refresh <'token'|'cache'>"""
 
-    session = CentralApi(account)
-    central = session.central
+    central = CentralApi(account)
 
     if what.startswith("token"):
-        Response(central).refresh_token()
+        from centralcli.response import Session
+        Session(central.auth).refresh_token()
     else:  # cache is only other option
-        Cache(session=session, refresh=True)
+        cli.cache(refresh=True)
 
 
-@app.command()
+@app.command(hidden=True, epilog="Output is displayed in yaml by default.")
 def method_test(method: str = typer.Argument(...),
                 kwargs: List[str] = typer.Argument(None),
-                do_json: bool = typer.Option(True, "--json", is_flag=True, help="Output in JSON"),
-                do_yaml: bool = typer.Option(False, "--yaml", is_flag=True, help="Output in YAML"),
-                do_csv: bool = typer.Option(False, "--csv", is_flag=True, help="Output in CSV"),
-                do_table: bool = typer.Option(False, "--simple", is_flag=True, help="Output in Table"),
-                do_rich: bool = typer.Option(False, "--rich", is_flag=True, help="Alpha Testing rich formatter"),
+                do_json: bool = typer.Option(False, "--json", is_flag=True, help="Output in JSON", show_default=False),
+                do_yaml: bool = typer.Option(False, "--yaml", is_flag=True, help="Output in YAML", show_default=False),
+                do_csv: bool = typer.Option(False, "--csv", is_flag=True, help="Output in CSV", show_default=False),
+                do_table: bool = typer.Option(False, "--table", is_flag=True, help="Output in Table", show_default=False),
                 outfile: Path = typer.Option(None, help="Output to file (and terminal)", writable=True),
-                no_pager: bool = typer.Option(False, "--no-pager", help="Disable Paged Output"),
+                no_pager: bool = typer.Option(True, "--pager", help="Enable Paged Output"),
                 update_cache: bool = typer.Option(False, "-U", hidden=True),  # Force Update of cache for testing
+                default: bool = typer.Option(False, "-d", is_flag=True, help="Use default central account", show_default=False,
+                                             callback=cli.default_callback),
                 debug: bool = typer.Option(False, "--debug", envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",
-                                           callback=debug_callback),
+                                           callback=cli.debug_callback),
                 account: str = typer.Option("central_info",
                                             envvar="ARUBACLI_ACCOUNT",
                                             help="The Aruba Central Account to use (must be defined in the config)",
-                                            callback=account_name_callback),
+                                            autocompletion=cli.cache.account_completion,
+                                            ),
                 ) -> None:
     """dev testing commands to run CentralApi methods from command line
 
@@ -616,45 +351,114 @@ def method_test(method: str = typer.Argument(...),
         or  arg1, arg2, keyword = value, keyword2=value
 
     Displays all attributes of Response object
-   """
-    session = CentralApi(account)
-    if not hasattr(session, method):
+    """
+    cli.cache(refresh=update_cache)
+    central = CentralApi(account)
+    if not hasattr(central, method):
+        bpdir = Path(__file__).parent / "boilerplate"
+        all_calls = [
+            importlib.import_module(f"centralcli.{bpdir.name}.{f.stem}") for f in bpdir.iterdir()
+            if not f.name.startswith("_") and f.suffix == ".py"
+        ]
+        for m in all_calls:
+            if hasattr(m.AllCalls(), method):
+                central = m.AllCalls()
+                break
+
+    if not hasattr(central, method):
         typer.secho(f"{method} does not exist", fg="red")
         raise typer.Exit(1)
-    args = [k for k in kwargs if "=" not in k]
-    kwargs = [k.replace(" =", "=").replace("= ", "=").replace(",", " ").replace("  ", " ") for k in kwargs]
+
+    kwargs = (
+        "~".join(kwargs).replace("'", "").replace('"', '').replace("~=", "=").replace("=~", "=").replace(",~", ",").split("~")
+    )
+    args = [k if not k.isdigit() else int(k) for k in kwargs if "=" not in k]
     kwargs = [k.split("=") for k in kwargs if "=" in k]
-    kwargs = {k[0]: k[1] for k in kwargs}
+    kwargs = {k[0]: k[1] if not k[1].isdigit() else int(k[1]) for k in kwargs}
+    for k, v in kwargs.items():
+        if v.startswith("[") and v.endswith("]"):
+            kwargs[k] = [vv if not vv.isdigit() else int(vv) for vv in v.strip("[]").split(",")]
+        if v.lower() in ["true", "false"]:
+            kwargs[k] = True if v.lower() == "true" else False
 
-    typer.secho(f"session.{method}({', '.join(a for a in args)}, "
-                f"{', '.join([f'{k}={kwargs[k]}' for k in kwargs]) if kwargs else ''})", fg="cyan")
-    resp = session.request(getattr(session, method), *args, **kwargs)
+    from rich.console import Console
+    c = Console(file=outfile)
 
-    for k, v in resp.__dict__.items():
-        if k != "output":
-            if debug or not k.startswith("_"):
-                typer.echo(f"  {typer.style(k, fg='cyan')}: {v}")
+    req = (
+        f"central.{method}({', '.join(str(a) for a in args)}, "
+        f"{', '.join([f'{k}={kwargs[k]}' for k in kwargs]) if kwargs else ''})"
+    )
 
-    data = eval_resp(resp, pad=2)
+    resp = central.request(getattr(central, method), *args, **kwargs)
+    if "should be str" in resp.output and "bool" in resp.output:
+        c.log(f"{resp.output}.  LAME!  Converting to str!")
+        args = tuple([str(a).lower() if isinstance(a, bool) else a for a in args])
+        kwargs = {k: str(v).lower() if isinstance(v, bool) else v for k, v in kwargs.items()}
+    resp = central.request(getattr(central, method), *args, **kwargs)
 
-    if data:
-        if do_yaml is True:
-            tablefmt = "yaml"
-        elif do_csv is True:
-            tablefmt = "csv"
-        elif do_rich is True:
-            tablefmt = "rich"
-        elif do_table is True:
-            tablefmt = "simple"
-        else:
-            tablefmt = "json"
+    attrs = {
+        k: v for k, v in resp.__dict__.items() if k not in ["output", "raw"] and (log.DEBUG or not k.startswith("_"))
+    }
 
-        typer.echo(f"\n{typer.style('output', fg='cyan')}:")
-        display_results(data, tablefmt=tablefmt, pager=not no_pager, outfile=outfile)
+    c.print(req)
+    c.print("\n".join([f"  {k}: {v}" for k, v in attrs.items()]))
+
+    tablefmt = cli.get_format(
+        do_json, do_yaml, do_csv, do_table, default="yaml"
+    )
+
+    typer.echo(f"\n{typer.style('CentralCLI Response Output', fg='bright_green')}:")
+    cli.display_results(data=resp.output, tablefmt=tablefmt, pager=not no_pager, outfile=outfile)
+    if resp.raw:
+        typer.echo(f"\n{typer.style('Raw Response Output', fg='bright_green')}:")
+        cli.display_results(data=resp.raw, tablefmt="json", pager=not no_pager, outfile=outfile)
+
+
+def all_commands_callback(ctx: typer.Context, debug: bool):
+    if not ctx.resilient_parsing:
+        account, debug, default, update_cache = None, None, None, None
+        for idx, arg in enumerate(sys.argv):
+            if arg == "--debug":
+                debug = True
+            elif arg == "-d":
+                default = True
+            elif arg == "--account" and "-d" not in sys.argv:
+                account = sys.argv[idx + 1]
+            elif arg == "-U":
+                update_cache = True
+            elif arg.startswith("-") and not arg.startswith("--"):
+                if "d" in arg:
+                    default = True
+                if "U" in arg:
+                    update_cache = True
+
+        account = account or os.environ.get("ARUBACLI_ACCOUNT", False)
+        debug = debug or os.environ.get("ARUBACLI_DEBUG", False)
+
+        if default:
+            default = cli.default_callback(ctx, True)
+        elif account:
+            cli.account_name_callback(ctx, account=account)
+        if debug:
+            cli.debug_callback(ctx, debug=debug)
+        if update_cache:
+            # cli.cache(refresh=True)
+            # TODO can do cache update here once update is removed from all commands
+            pass
 
 
 @app.callback()
-def callback():
+def callback(
+    ctx: typer.Context,
+    debug: bool = typer.Option(False, "--debug", is_flag=True, envvar="ARUBACLI_DEBUG", help="Enable Additional Debug Logging",
+                               callback=all_commands_callback),
+    default: bool = typer.Option(False, "-d", is_flag=True, help="Use default central account", show_default=False,),
+    account: str = typer.Option("central_info",
+                                envvar="ARUBACLI_ACCOUNT",
+                                help="The Aruba Central Account to use (must be defined in the config)",
+                                autocompletion=cli.cache.account_completion),
+    update_cache: bool = typer.Option(False, "-U", hidden=True),
+) -> None:
     """
     Aruba Central API CLI
     """

@@ -18,4 +18,9 @@
     "cSpell.ignoreWords": [
         "secho"
     ],
+    "cSpell.words": [
+        "cencli",
+        "centralcli"
+    ],
+    "restructuredtext.confPath": "${workspaceFolder}/docs",
 }
